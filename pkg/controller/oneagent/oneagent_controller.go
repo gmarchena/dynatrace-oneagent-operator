@@ -3,7 +3,6 @@ package oneagent
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"time"
 
@@ -31,7 +30,7 @@ import (
 
 const (
 	dynatracePaasToken = "paasToken"
-	dynatraceApiToken = "apiToken"
+	dynatraceApiToken  = "apiToken"
 )
 
 // time between consecutive queries for a new pod to get ready
@@ -154,6 +153,19 @@ func (r *ReconcileOneAgent) Reconcile(request reconcile.Request) (reconcile.Resu
 	if err != nil {
 		return reconcile.Result{}, err
 	} else if updateCR == true {
+		reqLogger.Info("updating custom resource", "cause", "new version", "status", instance.Status)
+		err := r.updateCR(instance)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+
+		return reconcile.Result{RequeueAfter: 5 * time.Minute}, nil
+	}
+
+	updateCR, err = r.reconcileUpgrade(reqLogger, instance)
+	if err != nil {
+		return reconcile.Result{}, err
+	} else if updateCR == true {
 		reqLogger.Info("updating custom resource", "cause", "version upgrade", "status", instance.Status)
 		err := r.updateCR(instance)
 		if err != nil {
@@ -213,9 +225,7 @@ func (r *ReconcileOneAgent) reconcileRollout(reqLogger logr.Logger, instance *dy
 	return updateCR, nil
 }
 
-func (r *ReconcileOneAgent) reconcileVersion(reqLogger logr.Logger, instance *dynatracev1alpha1.OneAgent) (bool, error) {
-	updateCR := false
-
+func (r *ReconcileOneAgent) reconcileUpgrade(reqLogger logr.Logger, instance *dynatracev1alpha1.OneAgent) (bool, error) {
 	secret, err := r.getSecret(instance.Spec.Tokens, instance.Namespace)
 	if err != nil {
 		reqLogger.Error(err, "failed to get tokens", "secret", instance.Spec.Tokens)
@@ -235,17 +245,6 @@ func (r *ReconcileOneAgent) reconcileVersion(reqLogger logr.Logger, instance *dy
 		return false, err
 	}
 
-	// get desired version
-	desired, err := dtc.GetVersionForLatest(dtclient.OsUnix, dtclient.InstallerTypeDefault)
-	if err != nil {
-		reqLogger.Error(err, "failed to get desired version")
-		return false, err
-	} else if desired != "" && instance.Status.Version != desired {
-		reqLogger.Info("new version available", "actual", instance.Status.Version, "desired", desired)
-		instance.Status.Version = desired
-		updateCR = true
-	}
-
 	// query oneagent pods
 	podList := &corev1.PodList{}
 	labelSelector := labels.SelectorFromSet(buildLabels(instance.Name))
@@ -256,25 +255,29 @@ func (r *ReconcileOneAgent) reconcileVersion(reqLogger logr.Logger, instance *dy
 	err = r.client.List(context.TODO(), listOps, podList)
 	if err != nil {
 		reqLogger.Error(err, "failed to list pods", "listops", listOps)
-		return updateCR, err
+		return false, err
 	}
 
 	// determine pods to restart
-	podsToDelete, instances := getPodsToRestart(podList.Items, dtc, instance)
-	if !reflect.DeepEqual(instances, instance.Status.Items) {
-		reqLogger.Info("oneagent pod instances changed")
-		updateCR = true
-		instance.Status.Items = instances
+	//reqLogger.Info("pods", "podlist", podList.Items)
+	if doomedPod, version, err := getNextPodToRestart(podList.Items, dtc, instance.Status.Version, reqLogger); err != nil {
+		reqLogger.Error(err, "failure")
+	} else if doomedPod != nil {
+		reqLogger.Info("deleting pod", "pod", doomedPod.Name, "desired", instance.Status.Version, "actual", version)
+		err = r.client.Delete(context.TODO(), doomedPod)
+		if err != nil {
+			reqLogger.Error(err, "failed to delete pod", "pod", doomedPod.Name)
+			return false, err
+		}
+		item := instance.Status.Items[doomedPod.Name]
+		item.Version = "updating"
+		instance.Status.Items[doomedPod.Name] = item
+		return true, nil
+	} else {
+		reqLogger.Info("no pod eligible for upgrade")
 	}
 
-	// restart daemonset
-	err = r.deletePods(instance, podsToDelete)
-	if err != nil {
-		reqLogger.Error(err, "failed to update version")
-		return updateCR, err
-	}
-
-	return updateCR, nil
+	return false, nil
 }
 
 func (r *ReconcileOneAgent) updateCR(instance *dynatracev1alpha1.OneAgent) error {
@@ -363,6 +366,25 @@ func newPodSpecForCR(instance *dynatracev1alpha1.OneAgent) corev1.PodSpec {
 	}
 }
 
+// getNextPodToRestart returns a reference to the first pod which is eligible for restart
+func getNextPodToRestart(pods []corev1.Pod, dtc dtclient.Client, desiredVersion string, reqLogger logr.Logger) (*corev1.Pod, string, error) {
+	reqLogger.Info("determine next pod eligible for upgrade", "desired", desiredVersion, )
+
+	for _, pod := range pods {
+		ver, err := dtc.GetVersionForIp(pod.Status.HostIP)
+		reqLogger.Info("processing pod", "pod", pod.Name, "actual", ver)
+		if err != nil {
+			// something went wrong, try the next one
+			//continue
+			return nil, "", err
+		}
+		if ver != desiredVersion {
+			return &pod, ver, nil
+		}
+	}
+	return nil, "", nil
+}
+
 // getPodsToRestart determines if a pod needs to be restarted in order to get the desired agent version
 // Returns an array of pods and an array of OneAgentInstance objects for status update
 func getPodsToRestart(pods []corev1.Pod, dtc dtclient.Client, instance *dynatracev1alpha1.OneAgent) ([]corev1.Pod, map[string]dynatracev1alpha1.OneAgentInstance) {
@@ -438,4 +460,40 @@ func (r *ReconcileOneAgent) waitPodReadyState(instance *dynatracev1alpha1.OneAge
 		}
 	}
 	return status
+}
+
+func (r *ReconcileOneAgent) reconcileVersion(reqLogger logr.Logger, instance *dynatracev1alpha1.OneAgent) (bool, error) {
+	updateCR := false
+
+	secret, err := r.getSecret(instance.Spec.Tokens, instance.Namespace)
+	if err != nil {
+		reqLogger.Error(err, "failed to get tokens", "secret", instance.Spec.Tokens)
+		return false, nil
+	}
+
+	if err = verifySecret(secret); err != nil {
+		return false, err
+	}
+
+	// initialize dynatrace client
+	var certificateValidation = dtclient.SkipCertificateValidation(instance.Spec.SkipCertCheck)
+	apiToken, _ := getToken(secret, dynatraceApiToken)
+	paasToken, _ := getToken(secret, dynatracePaasToken)
+	dtc, err := dtclient.NewClient(instance.Spec.ApiUrl, apiToken, paasToken, certificateValidation)
+	if err != nil {
+		return false, err
+	}
+
+	// get desired version
+	desired, err := dtc.GetVersionForLatest(dtclient.OsUnix, dtclient.InstallerTypeDefault)
+	if err != nil {
+		reqLogger.Error(err, "failed to get desired version")
+		return false, err
+	} else if desired != "" && instance.Status.Version != desired {
+		reqLogger.Info("new version available", "actual", instance.Status.Version, "desired", desired)
+		instance.Status.Version = desired
+		updateCR = true
+	}
+
+	return updateCR, nil
 }

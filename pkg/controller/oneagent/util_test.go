@@ -1,6 +1,7 @@
 package oneagent
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 
@@ -251,7 +252,7 @@ func TestApplyOneAgentDefaults(t *testing.T) {
 	assert.Equalf(t, ds.Spec.Template.Spec.HostIPC, true, ".Spec.Template.Spec.HostIPC")
 	assert.Equalf(t, ds.Spec.Template.Spec.ServiceAccountName, "dynatrace-oneagent", ".Spec.Template.Spec.ServiceAccountName")
 }
-
+*/
 func TestGetPodsToRestart(t *testing.T) {
 	dtc := new(MyDynatraceClient)
 	dtc.On("GetVersionForIp", "127.0.0.1").Return("1.2.3", nil)
@@ -284,7 +285,7 @@ func TestGetPodsToRestart(t *testing.T) {
 	assert.Lenf(t, instances, 3, "list of instances")
 	assert.Equalf(t, instances["node-3"].Version, oa.Status.Items["node-3"].Version, "determine agent version from dynatrace server")
 }
-*/
+
 func newOneAgent() *api.OneAgent {
 	return &api.OneAgent{
 		TypeMeta: metav1.TypeMeta{
