@@ -196,6 +196,8 @@ spec:
             limits:
               cpu: 100m
               memory: 256Mi
+      imagePullSecrets:
+           - name: {12302429-alta-pull-secret}        
       nodeSelector:
         beta.kubernetes.io/os: linux
         beta.kubernetes.io/arch: amd64
